@@ -5,11 +5,21 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import json
+
+################################################################################
+# Simple Admin Authentication Layer
+# - Loads teacher credentials from teachers.json at startup.
+# - Provides /login, /logout, /me endpoints.
+# - Protects signup/unregister operations so only authenticated teachers mutate.
+# NOTE: This is intentionally lightweight (NO hashing, sessions via signed cookie
+# could be added later). For now, stores plain text for simplicity per issue #5.
+################################################################################
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +28,24 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# In-memory teacher credential store
+_teachers_path = current_dir / "teachers.json"
+try:
+    with open(_teachers_path, "r", encoding="utf-8") as f:
+        _teacher_data = json.load(f)
+        TEACHERS = {t["username"]: t["password"] for t in _teacher_data.get("teachers", [])}
+except FileNotFoundError:
+    TEACHERS = {}
+
+
+def require_teacher(request: Request):
+    """Dependency to ensure a logged-in teacher for mutating endpoints."""
+    user = request.cookies.get("session_user")
+    if not user or user not in TEACHERS:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return user
+
 
 # In-memory activity database
 activities = {
@@ -89,7 +117,7 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, teacher: str = Depends(require_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,8 +139,39 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, teacher: str = Depends(require_teacher)):
     """Unregister a student from an activity"""
+@app.post("/login")
+def login(request: Request, credentials: dict):
+    """Authenticate a teacher and set a simple cookie session.
+
+    Expected JSON body: {"username": "...", "password": "..."}
+    """
+    username = credentials.get("username", "").strip()
+    password = credentials.get("password", "")
+    if username in TEACHERS and TEACHERS[username] == password:
+        resp = {"message": "Login successful", "username": username}
+        response = Response(content=json.dumps(resp), media_type="application/json")
+        # Basic cookie (NOT secure for production). HttpOnly for minimal protection.
+        response.set_cookie("session_user", username, httponly=True, samesite="lax")
+        return response
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.post("/logout")
+def logout():
+    response = Response(content=json.dumps({"message": "Logged out"}), media_type="application/json")
+    response.delete_cookie("session_user")
+    return response
+
+
+@app.get("/me")
+def me(request: Request):
+    user = request.cookies.get("session_user")
+    if user and user in TEACHERS:
+        return {"authenticated": True, "username": user}
+    return {"authenticated": False}
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
